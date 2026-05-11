@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MNGR · Calendar Assistant</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%236e7bff'/><stop offset='1' stop-color='%239a83ff'/></linearGradient></defs><rect width='32' height='32' rx='8' fill='url(%23g)'/><text x='16' y='22' text-anchor='middle' font-family='-apple-system,Segoe UI,sans-serif' font-size='18' font-weight='800' fill='white'>M</text></svg>"
+    />
+    <style>
+      :root {
+        --bg: #0b0c10;
+        --panel: #14161c;
+        --panel-2: #1b1e26;
+        --border: #262a33;
+        --text: #e6e8ee;
+        --muted: #8b91a0;
+        --accent: #6e7bff;
+        --accent-2: #9a83ff;
+        --ok: #34d399;
+        --warn: #fbbf24;
+        --err: #f87171;
+        --bubble-user: linear-gradient(180deg, #2a2f43 0%, #21263a 100%);
+        --bubble-bot: #14161c;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background:
+          radial-gradient(1200px 600px at 80% -10%, rgba(110, 123, 255, 0.18), transparent 60%),
+          radial-gradient(900px 500px at -10% 110%, rgba(154, 131, 255, 0.15), transparent 60%),
+          var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter,
+          Roboto, "Helvetica Neue", Arial, sans-serif;
+        font-size: 15px;
+      }
+      .app {
+        max-width: 760px;
+        margin: 0 auto;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        padding: 24px 20px;
+        gap: 16px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 4px 2px;
+      }
+      .logo {
+        width: 34px; height: 34px;
+        border-radius: 9px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        display: grid; place-items: center;
+        font-weight: 800; color: white; letter-spacing: 0.5px;
+        box-shadow: 0 6px 24px rgba(110, 123, 255, 0.35);
+      }
+      header h1 {
+        font-size: 16px;
+        margin: 0;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+      }
+      header .sub {
+        color: var(--muted);
+        font-size: 12.5px;
+      }
+      header .spacer { flex: 1; }
+      .pill {
+        font-size: 12px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--muted);
+        display: inline-flex; align-items: center; gap: 6px;
+      }
+      .pill .dot {
+        width: 7px; height: 7px; border-radius: 50%;
+        background: var(--err);
+      }
+      .pill.ok .dot { background: var(--ok); }
+      .pill.ok { color: var(--text); }
+      .btn {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--text);
+        padding: 8px 14px;
+        border-radius: 10px;
+        font-size: 13px;
+        cursor: pointer;
+        transition: transform 0.08s ease, border-color 0.15s ease, background 0.15s ease;
+      }
+      .btn:hover { border-color: #3a4055; }
+      .btn:active { transform: translateY(1px); }
+      .btn.primary {
+        background: linear-gradient(180deg, var(--accent), var(--accent-2));
+        border-color: transparent;
+        color: white;
+        font-weight: 600;
+      }
+      .btn.ghost { background: transparent; }
+      .chat {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        overflow: hidden;
+      }
+      .messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 18px;
+        display: flex; flex-direction: column; gap: 10px;
+        scroll-behavior: smooth;
+      }
+      .msg {
+        display: flex;
+        max-width: 88%;
+        line-height: 1.45;
+      }
+      .msg .bubble {
+        padding: 10px 14px;
+        border-radius: 14px;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+      }
+      .msg.bot { align-self: flex-start; }
+      .msg.bot .bubble {
+        background: var(--bubble-bot);
+        border: 1px solid var(--border);
+        border-top-left-radius: 4px;
+      }
+      .msg.user { align-self: flex-end; }
+      .msg.user .bubble {
+        background: var(--bubble-user);
+        border: 1px solid #2c324a;
+        border-top-right-radius: 4px;
+      }
+      .msg.system .bubble {
+        background: rgba(110, 123, 255, 0.08);
+        border: 1px dashed rgba(110, 123, 255, 0.45);
+        color: var(--text);
+        font-size: 13px;
+      }
+      .typing .bubble {
+        color: var(--muted);
+        font-style: italic;
+      }
+      .typing .dots span {
+        display: inline-block; width: 5px; height: 5px;
+        margin: 0 1px; border-radius: 50%; background: var(--muted);
+        animation: blink 1.2s infinite ease-in-out;
+      }
+      .typing .dots span:nth-child(2) { animation-delay: 0.15s; }
+      .typing .dots span:nth-child(3) { animation-delay: 0.3s; }
+      @keyframes blink { 0%, 80%, 100% { opacity: 0.2 } 40% { opacity: 1 } }
+
+      .composer {
+        border-top: 1px solid var(--border);
+        background: var(--panel-2);
+        padding: 12px;
+        display: flex; gap: 10px; align-items: flex-end;
+      }
+      .composer textarea {
+        flex: 1;
+        background: var(--panel);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        font: inherit;
+        resize: none;
+        max-height: 160px;
+        min-height: 42px;
+        outline: none;
+      }
+      .composer textarea:focus { border-color: var(--accent); }
+      footer {
+        color: var(--muted);
+        font-size: 11.5px;
+        text-align: center;
+        padding-top: 4px;
+      }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .event-card {
+        margin-top: 8px;
+        padding: 10px 12px;
+        border: 1px solid rgba(52, 211, 153, 0.35);
+        background: rgba(52, 211, 153, 0.08);
+        border-radius: 10px;
+        font-size: 13px;
+      }
+      .event-card .title { font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <div class="logo">M</div>
+        <div>
+          <h1>MNGR Calendar Assistant</h1>
+          <div class="sub">Schedule meetings on your Google Calendar through chat.</div>
+        </div>
+        <div class="spacer"></div>
+        <span id="authPill" class="pill"><span class="dot"></span><span id="authText">Not connected</span></span>
+        <button id="connectBtn" class="btn primary">Connect Google Calendar</button>
+        <button id="resetBtn" class="btn ghost" title="Start a new conversation">Reset</button>
+      </header>
+
+      <div class="chat">
+        <div id="messages" class="messages"></div>
+        <div class="composer">
+          <textarea
+            id="input"
+            rows="1"
+            placeholder="Tell me what you'd like to schedule..."
+            autofocus
+          ></textarea>
+          <button id="sendBtn" class="btn primary">Send</button>
+        </div>
+      </div>
+
+      <footer>
+        Built for the MNGR technical task · FastAPI · Groq llama-3.3-70b · Google Calendar
+      </footer>
+    </div>
+
+    <script>
+      const $ = (sel) => document.querySelector(sel);
+      const messagesEl = $("#messages");
+      const inputEl = $("#input");
+      const sendBtn = $("#sendBtn");
+      const connectBtn = $("#connectBtn");
+      const resetBtn = $("#resetBtn");
+      const authPill = $("#authPill");
+      const authText = $("#authText");
+
+      let busy = false;
+
+      function addMessage(role, text, extra) {
+        const wrap = document.createElement("div");
+        wrap.className = `msg ${role}`;
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.textContent = text;
+        if (extra && extra.event) {
+          const card = document.createElement("div");
+          card.className = "event-card";
+          const t = document.createElement("div");
+          t.className = "title";
+          t.textContent = `Booked: ${extra.event.summary}`;
+          const meta = document.createElement("div");
+          const s = new Date(extra.event.start);
+          const e = new Date(extra.event.end);
+          meta.textContent = `${s.toLocaleString()} → ${e.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
+          card.appendChild(t);
+          card.appendChild(meta);
+          if (extra.event.htmlLink) {
+            const a = document.createElement("a");
+            a.href = extra.event.htmlLink;
+            a.target = "_blank";
+            a.rel = "noopener";
+            a.textContent = "Open in Google Calendar →";
+            card.appendChild(document.createElement("br"));
+            card.appendChild(a);
+          }
+          bubble.appendChild(card);
+        }
+        wrap.appendChild(bubble);
+        messagesEl.appendChild(wrap);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return wrap;
+      }
+
+      function addTyping() {
+        const wrap = document.createElement("div");
+        wrap.className = "msg bot typing";
+        wrap.innerHTML = `<div class="bubble"><span class="dots"><span></span><span></span><span></span></span> thinking</div>`;
+        messagesEl.appendChild(wrap);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return wrap;
+      }
+
+      async function refreshAuth() {
+        try {
+          const r = await fetch("/auth/status");
+          const data = await r.json();
+          if (data.authenticated) {
+            authPill.classList.add("ok");
+            authText.textContent = data.email
+              ? `Connected · ${data.email}`
+              : "Connected";
+            connectBtn.textContent = "Reconnect";
+          } else {
+            authPill.classList.remove("ok");
+            authText.textContent = "Not connected";
+            connectBtn.textContent = "Connect Google Calendar";
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      async function send() {
+        const text = inputEl.value.trim();
+        if (!text || busy) return;
+        busy = true;
+        sendBtn.disabled = true;
+        inputEl.value = "";
+        inputEl.style.height = "auto";
+        addMessage("user", text);
+        const typing = addTyping();
+        try {
+          const tz =
+            (Intl.DateTimeFormat().resolvedOptions().timeZone) || "UTC";
+          const r = await fetch("/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: text, timezone: tz }),
+          });
+          const data = await r.json();
+          typing.remove();
+          if (!r.ok) {
+            addMessage("system", `Error: ${data.detail || r.statusText}`);
+            return;
+          }
+          addMessage("bot", data.reply, { event: data.event_created });
+          if (data.requires_auth) {
+            addMessage(
+              "system",
+              "Click \"Connect Google Calendar\" above to authorize, then try again."
+            );
+          }
+          if (data.event_created) {
+            await refreshAuth();
+          }
+        } catch (err) {
+          typing.remove();
+          addMessage("system", `Network error: ${err.message}`);
+        } finally {
+          busy = false;
+          sendBtn.disabled = false;
+          inputEl.focus();
+        }
+      }
+
+      async function reset() {
+        await fetch("/chat/reset", { method: "POST" });
+        messagesEl.innerHTML = "";
+        greet();
+      }
+
+      function greet() {
+        addMessage(
+          "bot",
+          "Hi! I'm MNGR's calendar assistant. Tell me what you'd like to schedule - title, duration, and any preferred days or times."
+        );
+      }
+
+      inputEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          send();
+        }
+      });
+      inputEl.addEventListener("input", () => {
+        inputEl.style.height = "auto";
+        inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
+      });
+      sendBtn.addEventListener("click", send);
+      resetBtn.addEventListener("click", reset);
+      connectBtn.addEventListener("click", () => {
+        window.location.href = "/auth/google/login";
+      });
+
+      const params = new URLSearchParams(location.search);
+      if (params.get("auth") === "ok") {
+        // Ensure no stale (pre-auth) conversation lingers on the backend.
+        fetch("/chat/reset", { method: "POST" }).catch(() => {});
+        addMessage("system", "Google Calendar connected. You're good to go!");
+        greet();
+        history.replaceState({}, "", "/");
+      } else if (params.get("auth") === "denied") {
+        addMessage("system", "Google Calendar authorization was cancelled.");
+        history.replaceState({}, "", "/");
+      } else {
+        greet();
+      }
+
+      refreshAuth();
+    </script>
+  </body>
+</html>
