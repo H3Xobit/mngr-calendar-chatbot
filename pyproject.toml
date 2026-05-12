@@ -1,0 +1,30 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".venv", "tokens", "logs"]
+
+[tool.ruff.lint]
+# A pragmatic, demo-friendly subset. Catches real bugs, doesn't fight the style.
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes (unused imports, undefined names)
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade (modern syntax)
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line length handled by formatter, don't double-complain
+    "B008",   # FastAPI's Depends(Foo()) pattern is fine
+    "SIM117", # multiple-with sometimes clearer than nested
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # asserts in tests are the point
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q"

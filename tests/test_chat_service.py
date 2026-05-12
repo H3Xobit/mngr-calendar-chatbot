@@ -6,14 +6,12 @@ deterministically without ever hitting Google or Groq.
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 from models.schemas import CreatedEvent, FreeSlot
 from services import chat_service
-from services.calendar_service import CalendarError, NotAuthenticated
-
+from services.calendar_service import CalendarError, NotAuthenticated, SlotConflict
 
 # ---------- find_free_slots tool --------------------------------------------
 
@@ -22,8 +20,8 @@ def test_find_free_slots_tool_returns_labels():
     """Successful path: tool result must carry the human-readable labels."""
     fake = [
         FreeSlot(
-            start=datetime(2026, 5, 12, 13, 0, tzinfo=timezone.utc),
-            end=datetime(2026, 5, 12, 13, 30, tzinfo=timezone.utc),
+            start=datetime(2026, 5, 12, 13, 0, tzinfo=UTC),
+            end=datetime(2026, 5, 12, 13, 30, tzinfo=UTC),
         )
     ]
     with patch.object(
@@ -100,8 +98,8 @@ def test_create_event_tool_success():
         id="evt-1",
         htmlLink="https://calendar.google.com/event?eid=evt-1",
         summary="Product Sync",
-        start=datetime(2026, 5, 12, 13, 0, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 12, 13, 30, tzinfo=timezone.utc),
+        start=datetime(2026, 5, 12, 13, 0, tzinfo=UTC),
+        end=datetime(2026, 5, 12, 13, 30, tzinfo=UTC),
     )
     with patch.object(
         chat_service.calendar_service, "create_event", return_value=fake
@@ -161,7 +159,7 @@ def test_unknown_tool_name_is_handled():
 def test_iso_parser_accepts_zulu_suffix():
     """The LLM sometimes emits 'Z' instead of '+00:00' - must still parse."""
     parsed = chat_service._parse_iso("2026-05-12T13:00:00Z")
-    assert parsed == datetime(2026, 5, 12, 13, 0, tzinfo=timezone.utc)
+    assert parsed == datetime(2026, 5, 12, 13, 0, tzinfo=UTC)
 
 
 def test_tool_call_argument_parsing_tolerates_garbage_json():
@@ -236,3 +234,40 @@ def test_find_free_slots_tool_widens_window_when_latest_le_earliest():
         )
     assert captured["earliest_hour"] == 14
     assert captured["latest_hour"] == 15, "latest should widen to earliest+1"
+
+
+# ---------- pre-insert race fix ---------------------------------------------
+
+
+def test_create_event_slot_conflict_returns_structured_error():
+    """The pre-insert recheck fired and found a fresh booking in the window.
+
+    The user must NOT see a confirmation; the chat layer must surface
+    ``slot_conflict`` so the LLM can apologise and ask `find_free_slots`
+    again.
+    """
+    conflict_window = [
+        (
+            datetime(2026, 5, 12, 13, 10, tzinfo=UTC),
+            datetime(2026, 5, 12, 13, 25, tzinfo=UTC),
+        )
+    ]
+    with patch.object(
+        chat_service.calendar_service,
+        "create_event",
+        side_effect=SlotConflict("Taken just now.", conflict_window),
+    ):
+        result, created, needs_auth = chat_service._execute_tool_call(
+            "sess1",
+            "create_event",
+            {
+                "title": "Standup",
+                "start": "2026-05-12T13:00:00+00:00",
+                "end": "2026-05-12T13:30:00+00:00",
+            },
+        )
+    assert needs_auth is False
+    assert created is None, "no event should be reported as created"
+    assert result["error"] == "slot_conflict"
+    assert "advice" in result, "LLM needs guidance to re-fetch slots"
+    assert "find_free_slots" in result["advice"]

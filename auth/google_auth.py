@@ -57,7 +57,7 @@ def load_credentials(session_id: str) -> Credentials | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         creds = Credentials.from_authorized_user_info(data, SCOPES)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning("Could not load token for session=%s: %s", session_id[:8], exc)
         return None
 
@@ -65,7 +65,7 @@ def load_credentials(session_id: str) -> Credentials | None:
         try:
             creds.refresh(GoogleRequest())
             save_credentials(session_id, creds)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.warning("Token refresh failed for session=%s: %s", session_id[:8], exc)
             return None
     return creds

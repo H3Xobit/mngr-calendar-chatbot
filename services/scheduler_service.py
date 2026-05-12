@@ -6,8 +6,8 @@ without ever touching the Google API.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime, time, timedelta
-from typing import Iterable
 from zoneinfo import ZoneInfo
 
 from models.schemas import FreeSlot

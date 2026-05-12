@@ -7,6 +7,28 @@ and creates the event when you pick one.
 
 > **Stack:** FastAPI · Groq `llama-3.3-70b-versatile` · Google Calendar API (OAuth2) · vanilla HTML/CSS/JS
 
+[![CI](https://github.com/H3Xobit/mngr-calendar-chatbot/actions/workflows/ci.yml/badge.svg)](https://github.com/H3Xobit/mngr-calendar-chatbot/actions/workflows/ci.yml)
+
+## Highlights at a glance
+
+- **36 unit tests, two Python versions (3.11 & 3.12), green CI on every push.**
+- **Pre-insert freebusy race check.** Closes the documented booking-race: if a
+  conflict appears between `find_free_slots` and `events.insert`, the chat
+  service surfaces a structured `slot_conflict` error and the LLM apologises +
+  re-fetches availability instead of silently double-booking.
+- **Deep `/healthz/deep` probe** that actually pings Groq AND the Google
+  Calendar API host, so a Kubernetes probe (or the UI's status pill) knows
+  *which* upstream is unhealthy.
+- **Structured JSON logs** opt-in via `LOG_FORMAT=json` + a per-request
+  correlation id stamped on every log line and echoed in the `X-Request-ID`
+  response header.
+- **UI polish:** suggested-prompt chips, a Retry button on failed messages,
+  a live upstream-health pill, and request-id surfaced in the dev console for
+  support traceability.
+- **Defence in depth & friendly errors:** every Google API error code the app
+  has seen in the wild is translated to an actionable user message
+  (`accessNotConfigured`, `401`, `403/forbidden`, ...).
+
 ---
 
 ## 1. Overview and architecture
@@ -108,13 +130,15 @@ implications:
 | Failure                                    | What happens                                                                                                                                                  |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | No slots in the requested window           | LLM tells the user and offers to widen the window (more days, broader hours). No "I'll get back to you" silence.                                              |
-| Google API error / network blip            | `CalendarError` raised in `calendar_service`, caught in `chat_service`, returned to the LLM as `{"error":"calendar_error","message":...}`. LLM apologises and asks if they want to retry. Full traceback logged to `logs/app.log`. |
+| **Slot is taken between offer and booking (race)** | `create_event` does a freebusy recheck on exactly the proposed window before calling `events.insert`. If a conflict landed in that gap, `SlotConflict` is raised, the LLM apologises and immediately re-runs `find_free_slots`. Booking never happens silently. |
+| Google API error / network blip            | `CalendarError` raised in `calendar_service`, caught in `chat_service`, returned to the LLM as `{"error":"calendar_error","message":...}`. LLM apologises and asks if they want to retry. Full traceback logged to `logs/app.log`. The most common 403 / 401 / `accessNotConfigured` cases are translated to actionable text by `_friendly_http_error`. |
 | User input is ambiguous                    | The system prompt instructs the LLM to ask one clarifying question at a time rather than guessing.                                                              |
 | Access / refresh token expired             | `load_credentials` runs `Credentials.refresh()` automatically if a refresh token exists.                                                                       |
 | Refresh fails / scope changed              | Tool returns `{"error":"auth_required"}`. The HTTP response sets `requires_auth: true`. The UI shows "Connect Google Calendar" again.                          |
-| Groq API down                              | Caught in `chat_service.handle_user_message`, the user sees a friendly "language backend down, try again" message, error logged.                               |
+| Groq API down                              | Caught in `chat_service.handle_user_message`, the user sees a friendly "language backend down, try again" message, error logged. `/healthz/deep` reports `groq.ok=false` so a monitoring probe catches it without a user complaining first. |
+| **LLM emits an invalid tool argument**     | `BadRequestError` from Groq is caught once; the offending tool message is fed back to the LLM as a system note and the call is retried. Stops the LLM looping on `days_ahead: 0` style mistakes. |
 | LLM loops on tool calls                    | Hard cap of `max_tool_iterations=4` per user turn; falls back to a friendly "I got stuck, can you rephrase?" message.                                          |
-| Bad OAuth state on callback                | 400 response; user is redirected to home and asked to retry.                                                                                                   |
+| Bad OAuth state on callback                | The inflight-state buffer holds the last few states, so legitimate double-clicks during consent don't 400. Genuine mismatches still fail closed with a 400 and a clear log entry. |
 
 ---
 
@@ -159,11 +183,25 @@ Then open <http://localhost:8000>.
 pytest -v
 ```
 
-The 21 included tests cover slot-finding, busy-interval merging, timezone
-handling, "no availability" edge cases, the round-up-to-next-15-minutes
-behaviour, the chat-service tool dispatcher, defensive argument clamping
-(`days_ahead=0` -> `1`, etc.), and the working-window widening logic.
-No network is touched.
+The **36 included tests** cover:
+
+- Slot-finding, busy-interval merging, timezone handling, "no availability"
+  edge cases, round-up-to-next-15-minutes, free-slot label formatting.
+- The chat-service tool dispatcher, including defensive argument clamping
+  (`days_ahead=0` -> `1`, etc.) and the working-window widening logic.
+- The **pre-insert freebusy race fix**: a conflict appearing in the window
+  blocks `events.insert` from firing, edge-touching intervals are correctly
+  treated as non-conflicts, and a failed recheck propagates rather than
+  blindly booking.
+- The **friendly Google error translator** for the three commonest
+  production failures (`accessNotConfigured`, `401`, `403/forbidden`).
+- The **`/healthz` and `/healthz/deep` endpoints** in three states: both
+  upstreams healthy, Groq unreachable, Groq key missing.
+- The **request-ID middleware**: header is generated and echoed, an inbound
+  `X-Request-ID` is honoured for gateway tracing.
+
+No network is touched in any test - all HTTP calls are mocked at the seam.
+CI runs the suite on both Python 3.11 and 3.12.
 
 ---
 
@@ -217,22 +255,20 @@ sessions, so you can test from multiple accounts in parallel.
 ## 9. Known limitations
 
 - **In-memory conversation state.** Restarting the server clears all
-  in-flight conversations. Tokens persist (they're on disk).
+  in-flight conversations. Tokens persist on disk.
 - **Single user per browser session.** "Switching" Google accounts means
   clicking *Reconnect* and signing in again.
 - **Working hours are simple bounds.** No support for "I never take
   meetings Mondays" rules; would need a small preferences model.
-- **No conflict re-check at booking time.** We pick from slots returned by
-  `freebusy`; if a conflicting event lands in the few seconds between
-  proposal and booking, the event still gets created. A pre-insert
-  `freebusy` recheck would close that race.
 - **No attendees in the UI** (the API supports it, the chat UI doesn't yet
   surface invitee email entry).
-- **No tests for the LLM layer.** Tool-calling integration is exercised
-  manually; mocking Groq for deterministic tests is a follow-up.
-- **No timezone autodetection.** The LLM defaults to UTC unless the user
-  states a timezone. A real product should read the browser timezone and
-  pass it through.
+- **No streaming output yet.** The final assistant reply is sent as a
+  single JSON response. Streaming via SSE is on the roadmap (see §10),
+  but is genuinely fiddly given the tool-call/loop pattern - any
+  intermediate token could turn out to be a tool call.
+- **Timezone autodetection is best-effort.** The frontend sends the
+  browser's `Intl` timezone in the request body, but the LLM still falls
+  back to UTC if the message doesn't mention one.
 
 ---
 
@@ -240,25 +276,24 @@ sessions, so you can test from multiple accounts in parallel.
 
 Given another couple of days and a brief about real users:
 
-1. **Multi-calendar awareness** - read all calendars the user owns, not just
+1. **Streaming responses** - server-sent events from `/chat` so the final
+   reply (after any tool calls resolve) renders token-by-token. Groq's
+   streaming is genuinely fast and a clear UX win.
+2. **Multi-calendar awareness** - read all calendars the user owns, not just
    "primary", so events on shared workspace calendars don't double-book them.
-2. **Pre-insert race check** - re-query `freebusy` immediately before
-   `events.insert` and fail-safe if a conflict appeared.
-3. **Attendee handling end-to-end** - let the user say "with sam@...", surface
-   it in the UI, send invites, optionally check attendees' freebusy.
+3. **Attendee handling end-to-end** - let the user say "with sam@...",
+   surface it in the UI, send invites, optionally check attendees' freebusy.
 4. **Smarter slot ranking** - prefer slots that don't fragment the day,
    avoid back-to-back-to-back meetings, respect user "focus hours".
 5. **Persistence layer** - Postgres for conversation history, tokens, and
    user preferences; multi-instance ready.
-6. **Streaming responses** - server-sent events from `/chat` so replies
-   render token-by-token. With Groq this is genuinely fast and a big UX win.
-7. **MNGR-side integration** - wire the chatbot into the MNGR project
+6. **MNGR-side integration** - wire the chatbot into the MNGR project
    sidebar: pre-fill the project's stakeholders as attendees, file events
    under the right project automatically, surface them in the project
    timeline.
-8. **Evaluation harness** - recorded conversations + scripted tool stubs to
-   regression-test the LLM's behaviour when the prompt or model changes.
-9. **Other calendar backends** - Outlook/Microsoft 365 via Microsoft Graph,
+7. **LLM evaluation harness** - recorded conversations + scripted tool stubs
+   to regression-test the LLM's behaviour when the prompt or model changes.
+8. **Other calendar backends** - Outlook/Microsoft 365 via Microsoft Graph,
    so MNGR users on either side of the corporate/indie divide get the same
    experience.
 
@@ -268,23 +303,34 @@ Given another couple of days and a brief about real users:
 
 ```
 mngr-calendar-chatbot/
-├── main.py                       FastAPI entrypoint, routes, sessions.
+├── .github/
+│   └── workflows/ci.yml          Pytest + ruff on every push (3.11 & 3.12).
+├── main.py                       FastAPI entrypoint, routes, sessions,
+│                                 RequestIDMiddleware, /healthz/deep.
 ├── auth/
 │   └── google_auth.py            OAuth2 flow + per-session token store.
 ├── services/
-│   ├── calendar_service.py       Google Calendar reads/writes.
-│   ├── chat_service.py           Groq + tool calling orchestration.
+│   ├── calendar_service.py       Google Calendar reads/writes,
+│   │                             pre-insert freebusy race-check,
+│   │                             friendly HTTP error translator.
+│   ├── chat_service.py           Groq + tool calling orchestration,
+│   │                             SlotConflict handling.
 │   └── scheduler_service.py      Pure slot-finding algorithm.
 ├── models/
 │   └── schemas.py                Pydantic models.
 ├── utils/
 │   ├── config.py                 Env config (pydantic-settings).
-│   └── logger.py                 Rotating file + stdout logger.
+│   └── logger.py                 Rotating logger; text or JSON mode
+│                                 (LOG_FORMAT=json), request-id contextvar.
 ├── static/
-│   └── index.html                Single-page chat UI.
+│   └── index.html                Single-page chat UI: suggested-prompt
+│                                 chips, retry button, upstream-health pill.
 ├── tests/
-│   ├── test_calendar.py          Unit tests for the slot finder.
-│   └── test_chat_service.py      Unit tests for the LLM tool dispatcher.
+│   ├── test_calendar.py          Slot-finder unit tests.
+│   ├── test_calendar_service.py  Race-fix and friendly-error translator.
+│   ├── test_chat_service.py      LLM tool dispatcher (incl. SlotConflict).
+│   └── test_healthz.py           /healthz, /healthz/deep, request-id.
+├── pyproject.toml                Ruff + pytest config.
 ├── tokens/                       Per-session OAuth tokens (gitignored).
 ├── logs/                         logs/app.log (gitignored).
 ├── .env.example                  Env template.

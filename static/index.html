@@ -203,6 +203,59 @@
         font-size: 13px;
       }
       .event-card .title { font-weight: 600; }
+
+      /* Suggested-prompt chips */
+      .suggestions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 12px 18px 0;
+      }
+      .chip {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: var(--panel-2);
+        color: var(--text);
+        font-size: 12.5px;
+        padding: 7px 12px;
+        border-radius: 999px;
+        cursor: pointer;
+        transition: border-color 0.15s ease, background 0.15s ease;
+      }
+      .chip:hover {
+        border-color: var(--accent);
+        background: rgba(110, 123, 255, 0.08);
+      }
+      .chip[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+      /* Retry button beside a failed user message */
+      .retry-row {
+        display: flex;
+        justify-content: flex-end;
+        margin-top: -4px;
+      }
+      .retry-btn {
+        appearance: none;
+        background: transparent;
+        border: 1px solid var(--err);
+        color: var(--err);
+        font-size: 12px;
+        padding: 4px 10px;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      .retry-btn:hover { background: rgba(248, 113, 113, 0.08); }
+
+      /* Conflict banner (slot taken between offer and book) */
+      .msg.system.conflict .bubble {
+        background: rgba(251, 191, 36, 0.10);
+        border-color: rgba(251, 191, 36, 0.5);
+        color: var(--warn);
+      }
+
+      /* Upstream health pill */
+      .pill.warn .dot { background: var(--warn); }
+      .pill.warn { color: var(--warn); }
     </style>
   </head>
   <body>
@@ -214,12 +267,14 @@
           <div class="sub">Schedule meetings on your Google Calendar through chat.</div>
         </div>
         <div class="spacer"></div>
+        <span id="healthPill" class="pill" title="Click for /healthz/deep details"><span class="dot"></span><span id="healthText">Checking...</span></span>
         <span id="authPill" class="pill"><span class="dot"></span><span id="authText">Not connected</span></span>
         <button id="connectBtn" class="btn primary">Connect Google Calendar</button>
         <button id="resetBtn" class="btn ghost" title="Start a new conversation">Reset</button>
       </header>
 
       <div class="chat">
+        <div id="suggestions" class="suggestions"></div>
         <div id="messages" class="messages"></div>
         <div class="composer">
           <textarea
@@ -246,8 +301,35 @@
       const resetBtn = $("#resetBtn");
       const authPill = $("#authPill");
       const authText = $("#authText");
+      const healthPill = $("#healthPill");
+      const healthText = $("#healthText");
+      const suggestionsEl = $("#suggestions");
 
       let busy = false;
+      let lastUserMessage = null;
+
+      const SUGGESTED_PROMPTS = [
+        "Book a 30 minute design review tomorrow afternoon",
+        "Find me a 1 hour focus block in the next 2 days",
+        "Schedule Late Sync today between 9pm and 11pm, 30 minutes",
+      ];
+
+      function renderSuggestions() {
+        suggestionsEl.innerHTML = "";
+        for (const prompt of SUGGESTED_PROMPTS) {
+          const b = document.createElement("button");
+          b.className = "chip";
+          b.textContent = prompt;
+          b.addEventListener("click", () => {
+            inputEl.value = prompt;
+            send();
+          });
+          suggestionsEl.appendChild(b);
+        }
+      }
+      function hideSuggestions() {
+        suggestionsEl.innerHTML = "";
+      }
 
       function addMessage(role, text, extra) {
         const wrap = document.createElement("div");
@@ -313,14 +395,31 @@
         }
       }
 
-      async function send() {
-        const text = inputEl.value.trim();
+      function attachRetry(toMessage, originalText) {
+        const row = document.createElement("div");
+        row.className = "retry-row";
+        const btn = document.createElement("button");
+        btn.className = "retry-btn";
+        btn.textContent = "Retry";
+        btn.addEventListener("click", () => {
+          row.remove();
+          inputEl.value = originalText;
+          send();
+        });
+        row.appendChild(btn);
+        toMessage.appendChild(row);
+      }
+
+      async function send(messageOverride) {
+        const text = (messageOverride !== undefined ? messageOverride : inputEl.value).trim();
         if (!text || busy) return;
         busy = true;
         sendBtn.disabled = true;
         inputEl.value = "";
         inputEl.style.height = "auto";
-        addMessage("user", text);
+        hideSuggestions();
+        lastUserMessage = text;
+        const userMsg = addMessage("user", text);
         const typing = addTyping();
         try {
           const tz =
@@ -330,10 +429,13 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message: text, timezone: tz }),
           });
+          const requestId = r.headers.get("x-request-id");
+          if (requestId) console.debug("chat request_id=%s", requestId);
           const data = await r.json();
           typing.remove();
           if (!r.ok) {
             addMessage("system", `Error: ${data.detail || r.statusText}`);
+            attachRetry(userMsg, text);
             return;
           }
           addMessage("bot", data.reply, { event: data.event_created });
@@ -349,6 +451,7 @@
         } catch (err) {
           typing.remove();
           addMessage("system", `Network error: ${err.message}`);
+          attachRetry(userMsg, text);
         } finally {
           busy = false;
           sendBtn.disabled = false;
@@ -356,10 +459,38 @@
         }
       }
 
+      async function checkHealth() {
+        try {
+          const r = await fetch("/healthz/deep", { method: "GET" });
+          const data = await r.json();
+          if (r.ok && data.status === "ok") {
+            healthPill.classList.remove("warn");
+            healthPill.classList.add("ok");
+            healthText.textContent = "All systems normal";
+          } else {
+            healthPill.classList.remove("ok");
+            healthPill.classList.add("warn");
+            const broken = Object.entries(data.checks || {})
+              .filter(([, v]) => !v.ok)
+              .map(([k]) => k)
+              .join(", ");
+            healthText.textContent = broken
+              ? `Issue: ${broken}`
+              : "Backend degraded";
+          }
+          console.debug("healthz/deep:", data);
+        } catch (e) {
+          healthPill.classList.remove("ok");
+          healthPill.classList.add("warn");
+          healthText.textContent = "Health check failed";
+        }
+      }
+
       async function reset() {
         await fetch("/chat/reset", { method: "POST" });
         messagesEl.innerHTML = "";
         greet();
+        renderSuggestions();
       }
 
       function greet() {
@@ -391,15 +522,21 @@
         fetch("/chat/reset", { method: "POST" }).catch(() => {});
         addMessage("system", "Google Calendar connected. You're good to go!");
         greet();
+        renderSuggestions();
         history.replaceState({}, "", "/");
       } else if (params.get("auth") === "denied") {
         addMessage("system", "Google Calendar authorization was cancelled.");
+        renderSuggestions();
         history.replaceState({}, "", "/");
       } else {
         greet();
+        renderSuggestions();
       }
 
       refreshAuth();
+      checkHealth();
+      // Re-check health every 60s so the pill reflects current upstream state.
+      setInterval(checkHealth, 60_000);
     </script>
   </body>
 </html>

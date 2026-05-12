@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint (ruff)
+        run: ruff check . --output-format=github
+
+      - name: Run tests
+        env:
+          # Tests are offline; the keys exist only so pydantic-settings doesn't choke.
+          GROQ_API_KEY: dummy-for-tests
+          GOOGLE_CLIENT_ID: dummy-for-tests
+          GOOGLE_CLIENT_SECRET: dummy-for-tests
+          SESSION_SECRET: ci-not-a-real-secret
+        run: pytest -v --tb=short
+
+      - name: Show test count summary
+        if: success()
+        run: |
+          echo "::notice::Calendar chatbot test suite passed on Python ${{ matrix.python-version }}"

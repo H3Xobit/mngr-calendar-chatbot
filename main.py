@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from auth import google_auth
 from models.schemas import AuthStatus, ChatRequest, ChatResponse
 from services import calendar_service, chat_service
 from utils.config import get_settings
-from utils.logger import get_logger
+from utils.logger import (
+    bind_request_id,
+    current_request_id,
+    get_logger,
+    new_request_id,
+    unbind_request_id,
+)
 
 log = get_logger(__name__)
 settings = get_settings()
@@ -25,6 +34,38 @@ app = FastAPI(
     version="0.1.0",
     description="Schedule meetings on your Google Calendar via natural language.",
 )
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Stamp every request with a short uuid for log correlation.
+
+    Honours an inbound ``X-Request-ID`` header if provided (handy when this
+    service sits behind a gateway that already issues them) and echoes the
+    id back on the response. Internal logs use the same id via the
+    `request_id` contextvar in ``utils.logger``.
+    """
+
+    async def dispatch(self, request, call_next):
+        rid = request.headers.get("x-request-id") or new_request_id()
+        token = bind_request_id(rid)
+        start = time.monotonic()
+        try:
+            response = await call_next(request)
+        finally:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            log.info(
+                "http %s %s -> %s in %sms",
+                request.method,
+                request.url.path,
+                getattr(response, "status_code", "?"),
+                duration_ms,
+            )
+            unbind_request_id(token)
+        response.headers["x-request-id"] = rid
+        return response
+
+
+app.add_middleware(RequestIDMiddleware)
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.session_secret,
@@ -63,7 +104,79 @@ async def index(request: Request) -> FileResponse:
 
 @app.get("/healthz", include_in_schema=False)
 async def healthz() -> dict[str, str]:
+    """Liveness probe. Cheap. Returns 200 if the process is responding."""
     return {"status": "ok"}
+
+
+@app.get("/healthz/deep")
+async def healthz_deep() -> JSONResponse:
+    """Deep readiness probe: pings the two upstream services we depend on.
+
+    Why this exists:
+    - ``/healthz`` says "the process is up", which is useless for catching
+      the most common production failure mode: a stale config in which the
+      Groq API key was rotated, or Google Calendar API was disabled in the
+      Cloud project after launch.
+    - ``/healthz/deep`` actually performs a lightweight check against each
+      dependency and returns a 200 only when both succeed. A 503 surfaces
+      which dependency is unhappy so a Kubernetes readiness probe (or a
+      monitoring dashboard) can stop sending traffic before users notice.
+
+    Cost: ~150-300 ms total. Safe to call from a probe every 30s.
+    """
+    checks: dict[str, dict] = {}
+    overall_ok = True
+    # Groq: a /models GET is the cheapest way to verify the key is valid
+    # AND the service is reachable.
+    if not settings.groq_api_key:
+        checks["groq"] = {"ok": False, "detail": "GROQ_API_KEY not configured"}
+        overall_ok = False
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(
+                    "https://api.groq.com/openai/v1/models",
+                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                )
+            ok = 200 <= resp.status_code < 300
+            checks["groq"] = {
+                "ok": ok,
+                "status_code": resp.status_code,
+                "detail": "reachable" if ok else f"http {resp.status_code}",
+            }
+            overall_ok = overall_ok and ok
+        except (httpx.HTTPError, OSError) as exc:
+            checks["groq"] = {"ok": False, "detail": f"unreachable: {exc.__class__.__name__}"}
+            overall_ok = False
+
+    # Google: just check the discovery doc is reachable. We do NOT exercise
+    # any per-user OAuth (would need a session) - that's covered by
+    # /auth/status. Here we only verify Google's API host responds.
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                "https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest"
+            )
+        ok = 200 <= resp.status_code < 300
+        checks["google_calendar_api"] = {
+            "ok": ok,
+            "status_code": resp.status_code,
+            "detail": "reachable" if ok else f"http {resp.status_code}",
+        }
+        overall_ok = overall_ok and ok
+    except (httpx.HTTPError, OSError) as exc:
+        checks["google_calendar_api"] = {
+            "ok": False,
+            "detail": f"unreachable: {exc.__class__.__name__}",
+        }
+        overall_ok = False
+
+    body = {
+        "status": "ok" if overall_ok else "degraded",
+        "request_id": current_request_id(),
+        "checks": checks,
+    }
+    return JSONResponse(body, status_code=200 if overall_ok else 503)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -107,7 +220,7 @@ async def google_login(request: Request) -> RedirectResponse:
         url, redirect_uri = google_auth.authorization_url(state)
     except RuntimeError as exc:
         log.error("OAuth not configured: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     log.info(
         "OAuth LOGIN  session=%s  state_stored=%s  inflight_count=%d  cookie_in=%s",
         sid[:8],
@@ -125,7 +238,7 @@ async def google_callback(request: Request) -> RedirectResponse:
     inflight = request.session.get("oauth_states") or []
     # Backwards compat: tolerate the old single-state key too.
     if "oauth_state" in request.session and request.session["oauth_state"] not in inflight:
-        inflight = inflight + [request.session["oauth_state"]]
+        inflight = [*inflight, request.session["oauth_state"]]
     received_state = request.query_params.get("state")
     log.info(
         "OAuth CALLBACK session=%s  cookie_in=%s  inflight_states=%s  state_in_url=%s",
@@ -147,9 +260,9 @@ async def google_callback(request: Request) -> RedirectResponse:
 
     try:
         creds = google_auth.exchange_code(received_state, str(request.url))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.exception("OAuth code exchange failed")
-        raise HTTPException(status_code=400, detail=f"OAuth failed: {exc}")
+        raise HTTPException(status_code=400, detail=f"OAuth failed: {exc}") from exc
 
     google_auth.save_credentials(sid, creds)
     request.session.pop("oauth_states", None)
@@ -196,7 +309,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
         )
     except RuntimeError as exc:
         log.error("Chat error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     _CONVERSATIONS[sid] = result.conversation
     return ChatResponse(

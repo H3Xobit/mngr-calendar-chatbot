@@ -12,8 +12,8 @@ The bridge between LLM intent and the calendar lives in
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from groq import APIError, BadRequestError, Groq
@@ -58,6 +58,10 @@ How to behave:
   Calendar" button). On the user's NEXT message, attempt the calendar tool
   again - the user may have completed authorization in the meantime. Do not
   refuse to retry based on memory of an earlier failure.
+- If a tool returns a `slot_conflict` error, apologise briefly ("Looks
+  like that slot got taken just now"), immediately call `find_free_slots`
+  again with the original parameters to get fresh availability, and offer
+  the new options. Do NOT confirm a booking that did not happen.
 - If a tool returns any other error, apologise briefly and ask if they'd like
   to try again, then actually retry on the next message.
 - Never invent calendar slots or pretend an event was created. Only trust
@@ -247,10 +251,25 @@ def _execute_tool_call(
     except calendar_service.NotAuthenticated as exc:
         log.info("Tool '%s' blocked: not authenticated", name)
         return ({"error": "auth_required", "message": str(exc)}, None, True)
+    except calendar_service.SlotConflict as exc:
+        # The slot was free when we proposed it, somebody else booked it,
+        # and the pre-insert recheck caught it. Surface this specifically
+        # so the LLM apologises and offers a new slot instead of pretending
+        # the booking happened.
+        log.warning("Tool '%s' slot conflict: %s", name, exc)
+        return (
+            {
+                "error": "slot_conflict",
+                "message": str(exc),
+                "advice": "Call find_free_slots again to get fresh availability.",
+            },
+            None,
+            False,
+        )
     except calendar_service.CalendarError as exc:
         log.warning("Tool '%s' calendar error: %s", name, exc)
         return ({"error": "calendar_error", "message": str(exc)}, None, False)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.exception("Tool '%s' unexpected error", name)
         return ({"error": "internal_error", "message": str(exc)}, None, False)
 
@@ -279,7 +298,7 @@ def handle_user_message(
 
     conversation = list(conversation) if conversation else new_conversation()
     today_hint = (
-        f"(Today is {datetime.now(timezone.utc).strftime('%A %d %B %Y')} (UTC). "
+        f"(Today is {datetime.now(UTC).strftime('%A %d %B %Y')} (UTC). "
         "Use this for relative dates the user gives.)"
     )
     tz_hint = (
@@ -351,7 +370,7 @@ def handle_user_message(
             )
             conversation.append({"role": "assistant", "content": reply})
             return ChatTurnResult(reply=reply, conversation=conversation)
-        except APIError as exc:
+        except APIError:
             log.exception("Groq API error")
             reply = (
                 "I'm having trouble reaching my language backend right now. "

@@ -194,7 +194,6 @@ def test_find_free_slots_timezone():
 
 def test_freeslot_label_includes_day_date_and_timezone():
     """Labels presented to the user must always include day, date, and tz."""
-    tokyo = ZoneInfo("Asia/Tokyo")
     now = datetime(2026, 5, 11, 0, 0, tzinfo=UTC)  # 09:00 Tokyo
     slots = find_free_slots(
         busy=[],

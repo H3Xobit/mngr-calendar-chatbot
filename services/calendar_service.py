@@ -6,8 +6,8 @@ This module is the only place that talks to the Google Calendar HTTP API.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -28,6 +28,20 @@ class NotAuthenticated(CalendarError):
     """No (valid) credentials are stored for this session."""
 
 
+class SlotConflict(CalendarError):
+    """The chosen slot is no longer free.
+
+    Raised by ``create_event`` when the pre-insert freebusy recheck finds
+    a conflicting event has appeared between the original ``find_free_slots``
+    call and the booking attempt. This closes the well-known race in any
+    calendar app that books a slot the user picked seconds earlier.
+    """
+
+    def __init__(self, message: str, conflicts: list[tuple[datetime, datetime]]):
+        super().__init__(message)
+        self.conflicts = conflicts
+
+
 def _friendly_http_error(exc: HttpError) -> str:
     """Translate common Google API errors into actionable messages."""
     reason = ""
@@ -35,7 +49,7 @@ def _friendly_http_error(exc: HttpError) -> str:
         details = exc.error_details if hasattr(exc, "error_details") else []
         if details and isinstance(details, list):
             reason = details[0].get("reason", "")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
     status = exc.resp.status if hasattr(exc, "resp") else None
@@ -112,8 +126,8 @@ def list_busy_intervals(
     """Use the freebusy API to fetch busy intervals on the primary calendar."""
     svc = _client_for(session_id)
     body = {
-        "timeMin": time_min.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "timeMax": time_max.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "timeMin": time_min.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "timeMax": time_max.astimezone(UTC).isoformat().replace("+00:00", "Z"),
         "items": [{"id": "primary"}],
     }
     try:
@@ -148,7 +162,7 @@ def find_slots(
     now: datetime | None = None,
 ) -> list[FreeSlot]:
     """High-level helper: pull busy intervals then run the slot finder."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     horizon = now + timedelta(days=days_ahead + 1)
     busy = list_busy_intervals(session_id, now, horizon)
     return find_free_slots(
@@ -166,6 +180,27 @@ def find_slots(
 # ---------- Writes ------------------------------------------------------------
 
 
+def _recheck_slot_is_free(
+    session_id: str, start: datetime, end: datetime
+) -> list[tuple[datetime, datetime]]:
+    """Query freebusy for exactly the proposed window and return any conflicts.
+
+    This is the booking-race fix. Between the moment ``find_free_slots`` ran
+    and the moment we call ``events.insert``, a conflicting event may have
+    landed in the slot. If we skip this check we will happily double-book.
+    The recheck is one extra freebusy call (~50 ms) and turns a silent
+    double-booking into a structured ``SlotConflict`` error the LLM can
+    apologise for and immediately propose an alternative.
+    """
+    try:
+        return list_busy_intervals(session_id, start, end)
+    except CalendarError:
+        # If the recheck itself fails (network blip, 429), we propagate the
+        # original error rather than guessing. Better to surface "we could
+        # not verify the slot is still free" than to book blindly.
+        raise
+
+
 def create_event(
     session_id: str,
     title: str,
@@ -174,7 +209,34 @@ def create_event(
     description: str | None = None,
     attendees: Iterable[str] | None = None,
     timezone_name: str = "UTC",
+    skip_conflict_recheck: bool = False,
 ) -> CreatedEvent:
+    """Insert a calendar event after re-verifying the slot is still free.
+
+    Set ``skip_conflict_recheck=True`` only if the caller has already
+    verified the slot is free within the last few milliseconds (e.g. an
+    integration test).
+    """
+    if not skip_conflict_recheck:
+        conflicts = _recheck_slot_is_free(session_id, start, end)
+        # Defensive: freebusy returns intervals that overlap the queried
+        # window, but exact-edge touches (end == start) don't count as
+        # conflicts.
+        real_conflicts = [(s, e) for (s, e) in conflicts if not (e <= start or s >= end)]
+        if real_conflicts:
+            log.warning(
+                "Pre-insert recheck found %d conflict(s) in [%s, %s] for session=%s",
+                len(real_conflicts),
+                start.isoformat(),
+                end.isoformat(),
+                session_id[:8],
+            )
+            raise SlotConflict(
+                "That slot was taken between when I offered it and now. "
+                "Pick another from the list or ask me to find new slots.",
+                real_conflicts,
+            )
+
     svc = _client_for(session_id)
     body: dict = {
         "summary": title,
